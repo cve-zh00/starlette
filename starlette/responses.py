@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import http.cookies
 import json
@@ -18,6 +19,7 @@ from urllib.parse import quote
 
 import anyio
 import anyio.to_thread
+import asyncfiles
 
 from starlette._utils import create_collapsing_task_group
 from starlette.background import BackgroundTask
@@ -416,14 +418,28 @@ class FileResponse(Response):
 
     # TODO: Remove this wrapper once minimum AnyIO includes https://github.com/agronholm/anyio/pull/1314.
     @asynccontextmanager
-    async def _open_file(self) -> AsyncIterator[anyio.AsyncFile[bytes]]:
-        file = await anyio.open_file(self.path, mode="rb")
+    async def _open_file(self) -> AsyncIterator[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]:
+        file: anyio.AsyncFile[bytes] | asyncfiles.BinaryFile
+        if asyncio._get_running_loop() is not None:
+            file = await asyncfiles.open(self.path, mode="rb", buffer_size=self.chunk_size).__aenter__()
+        else:
+            file = await anyio.open_file(self.path, mode="rb")
         try:
             yield file
         finally:
             # Closing must finish even when the transfer is cancelled.
             with anyio.CancelScope(shield=True):
-                await file.aclose()
+                if isinstance(file, asyncfiles.BinaryFile):
+                    await file.close()
+                else:
+                    await file.aclose()
+
+    @staticmethod
+    async def _seek_file(file: anyio.AsyncFile[bytes] | asyncfiles.BinaryFile, offset: int) -> None:
+        if isinstance(file, asyncfiles.BinaryFile):
+            file.seek(offset)
+        else:
+            await file.seek(offset)
 
     async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
@@ -450,7 +466,7 @@ class FileResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             async with self._open_file() as file:
-                await file.seek(start)
+                await self._seek_file(file, start)
                 more_body = True
                 while more_body:
                     chunk = await file.read(min(self.chunk_size, end - start))
@@ -480,7 +496,7 @@ class FileResponse(Response):
             async with self._open_file() as file:
                 for start, end in ranges:
                     await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
-                    await file.seek(start)
+                    await self._seek_file(file, start)
                     while start < end:
                         chunk = await file.read(min(self.chunk_size, end - start))
                         if not chunk:

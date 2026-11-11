@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import datetime as dt
-import os
 import re
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import anyio
+import asyncfiles
 import httpx2 as httpx
 import pytest
 from python_multipart import MultipartParser
@@ -414,18 +415,23 @@ async def test_file_response_with_pathsend(tmpdir: Path) -> None:
 
 
 @pytest.fixture
-def file_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, list[anyio.AsyncFile[bytes]]]:
+def file_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]]:
     path = tmp_path / "file.bin"
     path.write_bytes(b"x" * (8 * FileResponse.chunk_size))
-    files: list[anyio.AsyncFile[bytes]] = []
-    open_file = anyio.open_file
+    files: list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile] = []
+    open_file = FileResponse._open_file
 
-    async def track_open_file(path: str | os.PathLike[str], mode: Literal["rb"]) -> anyio.AsyncFile[bytes]:
-        file = await open_file(path, mode=mode)
-        files.append(file)
-        return file
+    @asynccontextmanager
+    async def track_open_file(
+        self: FileResponse,
+    ) -> AsyncIterator[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]:
+        async with open_file(self) as file:
+            files.append(file)
+            yield file
 
-    monkeypatch.setattr(anyio, "open_file", track_open_file)
+    monkeypatch.setattr(FileResponse, "_open_file", track_open_file)
     return path, files
 
 
@@ -442,7 +448,9 @@ def scope(request: pytest.FixtureRequest) -> Scope:
 @pytest.mark.anyio
 @pytest.mark.parametrize("spec_version", [None, "2.3"])
 async def test_file_response_stops_on_disconnect(
-    file_path: tuple[Path, list[anyio.AsyncFile[bytes]]], scope: Scope, spec_version: str | None
+    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]],
+    scope: Scope,
+    spec_version: str | None,
 ) -> None:
     path, files = file_path
     if spec_version is not None:
@@ -485,7 +493,9 @@ async def test_file_response_stops_on_disconnect(
 @pytest.mark.anyio
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 async def test_file_response_closes_on_cancellation(
-    file_path: tuple[Path, list[anyio.AsyncFile[bytes]]], scope: Scope, spec_version: str
+    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]],
+    scope: Scope,
+    spec_version: str,
 ) -> None:
     path, files = file_path
     scope["asgi"] = {"spec_version": spec_version}
@@ -515,7 +525,9 @@ async def test_file_response_closes_on_cancellation(
 @pytest.mark.anyio
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 async def test_file_response_closes_on_send_error(
-    file_path: tuple[Path, list[anyio.AsyncFile[bytes]]], scope: Scope, spec_version: str
+    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]],
+    scope: Scope,
+    spec_version: str,
 ) -> None:
     path, files = file_path
     scope["asgi"] = {"spec_version": spec_version}
@@ -1300,3 +1312,25 @@ async def test_file_response_multi_range_unexpected_eof(tmp_path: Path) -> None:
             ),
         ):
             await client.get("/", headers={"Range": "bytes=0-2,5-7"})
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("headers", [{}, {"Range": "bytes=0-3"}, {"Range": "bytes=0-3,6-9"}])
+async def test_file_response_asyncio_does_not_use_threadpool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    headers: dict[str, str],
+    anyio_backend_name: str,
+) -> None:
+    if anyio_backend_name != "asyncio":
+        return
+
+    path = tmp_path / "file.txt"
+    path.write_bytes(b"0123456789")
+    response = FileResponse(path, stat_result=path.stat())
+    monkeypatch.delattr(anyio.to_thread, "run_sync")
+
+    transport = httpx.ASGITransport(app=response)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        res = await client.get("/", headers=headers)
+        assert res.status_code in (200, 206)

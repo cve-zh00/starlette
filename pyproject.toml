@@ -32,6 +32,7 @@ classifiers = [
 ]
 dependencies = [
     "anyio>=4.0.0,<5",
+    "py-asyncfiles>=1.10.4",
     "typing_extensions>=4.10.0; python_version < '3.13'",
 ]
 
@@ -78,6 +79,7 @@ exclude-newer = "7 days"
 
 [tool.uv.exclude-newer-package]
 certifi = "2026-10-20T23:59:59Z"
+py-asyncfiles = false
 
 [project.urls]
 Homepage = "https://github.com/Kludex/starlette"
