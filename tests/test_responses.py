@@ -2,22 +2,24 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import subprocess
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
+from importlib.metadata import requires
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, Mock
 
 import anyio
-import asyncfiles
 import httpx2 as httpx
 import pytest
 from python_multipart import MultipartParser
 
-from starlette import status
+from starlette import responses, status
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.requests import ClientDisconnect, Request
@@ -25,6 +27,9 @@ from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Re
 from starlette.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 from tests.types import TestClientFactory
+
+if TYPE_CHECKING:
+    from asyncfiles import BinaryFile
 
 
 def test_text_response(test_client_factory: TestClientFactory) -> None:
@@ -253,6 +258,145 @@ def test_file_response(tmp_path: Path, test_client_factory: TestClientFactory) -
     assert filled_by_bg_task == "6, 7, 8, 9"
 
 
+def test_asyncfiles_optional_dependency() -> None:
+    requirements = requires("starlette")
+    assert requirements is not None
+    assert [requirement for requirement in requirements if requirement.startswith("py-asyncfiles")] == [
+        "py-asyncfiles>=1.10.4; extra == 'asyncfiles'"
+    ]
+
+
+def test_file_response_import_without_asyncfiles(tmp_path: Path) -> None:
+    path = tmp_path / "file.txt"
+    path.write_bytes(b"0123456789")
+    # Use a fresh interpreter so a previously imported native module cannot mask its absence.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import sys
+
+sys.modules["asyncfiles"] = None
+
+import anyio
+from starlette.responses import FileResponse, Response
+
+assert Response("hello").body == b"hello"
+
+async def main():
+    async with FileResponse(sys.argv[1])._open_file() as file:
+        assert isinstance(file, anyio.AsyncFile)
+        await FileResponse._seek_file(file, 3)
+        assert await file.read() == b"3456789"
+    assert file.closed
+
+asyncio.run(main())
+""",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("error_type", ["ImportError", "ModuleNotFoundError", "RuntimeError"])
+def test_file_response_broken_asyncfiles_import(error_type: str) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import builtins
+import sys
+
+original_import = builtins.__import__
+error_class = {
+    "ImportError": ImportError,
+    "ModuleNotFoundError": ModuleNotFoundError,
+    "RuntimeError": RuntimeError,
+}[sys.argv[1]]
+if sys.argv[1] == "RuntimeError":
+    error = error_class("broken native extension")
+else:
+    error = error_class("broken native extension", name="asyncfiles._core")
+
+def import_module(name, *args, **kwargs):
+    if name == "asyncfiles":
+        raise error
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = import_module
+import starlette.responses
+""",
+            error_type,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert f"{error_type}: broken native extension" in result.stderr
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("asyncfiles_available", [False, True])
+@pytest.mark.parametrize("headers", [{}, {"Range": "bytes=0-3"}, {"Range": "bytes=0-3,6-9"}])
+async def test_file_response_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    anyio_backend_name: str,
+    asyncfiles_available: bool,
+    headers: dict[str, str],
+) -> None:
+    native = getattr(responses, "asyncfiles")
+    if asyncfiles_available and native is None:
+        pytest.skip("Requires the asyncfiles extra")
+    if not asyncfiles_available:
+        monkeypatch.setattr(responses, "asyncfiles", None)
+
+    anyio_open = AsyncMock(wraps=anyio.open_file)
+    monkeypatch.setattr(anyio, "open_file", anyio_open)
+    native_open = Mock()
+    if native is not None:
+        native_open = Mock(wraps=native.open)
+        if anyio_backend_name == "trio":
+            native_open.side_effect = AssertionError("Trio must not use asyncfiles")
+        monkeypatch.setattr(native, "open", native_open)
+
+    path = tmp_path / "file.txt"
+    path.write_bytes(b"0123456789")
+    transport = httpx.ASGITransport(app=FileResponse(path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/", headers=headers)
+    if not headers:
+        assert response.status_code == 200
+        assert response.content == b"0123456789"
+    elif headers["Range"] == "bytes=0-3":
+        assert response.status_code == 206
+        assert response.content == b"0123"
+    else:
+        assert response.status_code == 206
+        boundary = response.headers["content-type"].split("boundary=")[1]
+        expected = (
+            f"--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            "Content-Range: bytes 0-3/10\r\n\r\n0123\r\n"
+            f"--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Range: bytes 6-9/10\r\n\r\n6789\r\n--{boundary}--"
+        ).encode()
+        assert response.content == expected
+
+    if asyncfiles_available and anyio_backend_name == "asyncio":
+        native_open.assert_called_once_with(path, mode="rb", buffer_size=FileResponse.chunk_size)
+        anyio_open.assert_not_called()
+    else:
+        anyio_open.assert_awaited_once_with(path, mode="rb")
+        native_open.assert_not_called()
+
+
 @pytest.mark.anyio
 async def test_file_response_on_head_method(tmp_path: Path) -> None:
     path = tmp_path / "xyz"
@@ -414,19 +558,24 @@ async def test_file_response_with_pathsend(tmpdir: Path) -> None:
     )
 
 
-@pytest.fixture
+@pytest.fixture(params=[False, True])
 def file_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]]:
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> tuple[Path, list[anyio.AsyncFile[bytes] | BinaryFile]]:
+    if request.param:
+        if getattr(responses, "asyncfiles") is None:
+            pytest.skip("Requires the asyncfiles extra")
+    else:
+        monkeypatch.setattr(responses, "asyncfiles", None)
     path = tmp_path / "file.bin"
     path.write_bytes(b"x" * (8 * FileResponse.chunk_size))
-    files: list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile] = []
+    files: list[anyio.AsyncFile[bytes] | BinaryFile] = []
     open_file = FileResponse._open_file
 
     @asynccontextmanager
     async def track_open_file(
         self: FileResponse,
-    ) -> AsyncIterator[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]:
+    ) -> AsyncIterator[anyio.AsyncFile[bytes] | BinaryFile]:
         async with open_file(self) as file:
             files.append(file)
             yield file
@@ -448,7 +597,7 @@ def scope(request: pytest.FixtureRequest) -> Scope:
 @pytest.mark.anyio
 @pytest.mark.parametrize("spec_version", [None, "2.3"])
 async def test_file_response_stops_on_disconnect(
-    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]],
+    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | BinaryFile]],
     scope: Scope,
     spec_version: str | None,
 ) -> None:
@@ -493,7 +642,7 @@ async def test_file_response_stops_on_disconnect(
 @pytest.mark.anyio
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 async def test_file_response_closes_on_cancellation(
-    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]],
+    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | BinaryFile]],
     scope: Scope,
     spec_version: str,
 ) -> None:
@@ -525,7 +674,7 @@ async def test_file_response_closes_on_cancellation(
 @pytest.mark.anyio
 @pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
 async def test_file_response_closes_on_send_error(
-    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]],
+    file_path: tuple[Path, list[anyio.AsyncFile[bytes] | BinaryFile]],
     scope: Scope,
     spec_version: str,
 ) -> None:
@@ -1324,6 +1473,8 @@ async def test_file_response_asyncio_does_not_use_threadpool(
 ) -> None:
     if anyio_backend_name != "asyncio":
         return
+    if getattr(responses, "asyncfiles") is None:
+        pytest.skip("Requires the asyncfiles extra")
 
     path = tmp_path / "file.txt"
     path.write_bytes(b"0123456789")

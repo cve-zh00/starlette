@@ -94,6 +94,9 @@ Starlette only requires `anyio`, and the following are optional:
 
 You can install all of these with `pip install starlette[full]`.
 
+Install `starlette[asyncfiles]` separately to enable native asynchronous file I/O for `FileResponse`
+on asyncio. Without this extra, or when running on Trio, file responses use AnyIO.
+
 ## Framework or Toolkit
 
 Starlette is designed to be used either as a complete framework, or as

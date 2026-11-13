@@ -32,11 +32,11 @@ classifiers = [
 ]
 dependencies = [
     "anyio>=4.0.0,<5",
-    "py-asyncfiles>=1.10.4",
     "typing_extensions>=4.10.0; python_version < '3.13'",
 ]
 
 [project.optional-dependencies]
+asyncfiles = ["py-asyncfiles>=1.10.4"]
 full = [
     "itsdangerous",
     "jinja2",
@@ -110,6 +110,10 @@ combine-as-imports = true
 
 [tool.mypy]
 strict = true
+
+[[tool.mypy.overrides]]
+module = "asyncfiles"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "starlette.testclient.*"

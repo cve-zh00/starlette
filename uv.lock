@@ -1578,11 +1578,13 @@ name = "starlette"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
-    { name = "py-asyncfiles" },
     { name = "typing-extensions", version = "4.16.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
 ]
 
 [package.optional-dependencies]
+asyncfiles = [
+    { name = "py-asyncfiles" },
+]
 full = [
     { name = "httpx" },
     { name = "httpx2" },
@@ -1624,12 +1626,12 @@ requires-dist = [
     { name = "itsdangerous", marker = "extra == 'full'" },
     { name = "jinja2", marker = "extra == 'full'" },
     { name = "opentelemetry-api", marker = "extra == 'full'" },
-    { name = "py-asyncfiles", specifier = ">=1.10.4" },
+    { name = "py-asyncfiles", marker = "extra == 'asyncfiles'", specifier = ">=1.10.4" },
     { name = "python-multipart", marker = "extra == 'full'", specifier = ">=0.0.18" },
     { name = "pyyaml", marker = "extra == 'full'" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'", specifier = ">=4.10.0" },
 ]
-provides-extras = ["full"]
+provides-extras = ["asyncfiles", "full"]
 
 [package.metadata.requires-dev]
 dev = [

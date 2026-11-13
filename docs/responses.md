@@ -181,6 +181,10 @@ Have in mind that <a href="https://docs.python.org/3/glossary.html#term-file-lik
 
 Asynchronously streams a file as the response.
 
+By default, file responses use AnyIO for file operations. Install `starlette[asyncfiles]` to use
+`py-asyncfiles` for native asynchronous file I/O when running on asyncio. Trio always uses AnyIO,
+even when the extra is installed.
+
 Takes a different set of arguments to instantiate than the other response types:
 
 * `path` - The filepath to the file to stream.

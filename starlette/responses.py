@@ -14,12 +14,11 @@ from email.utils import format_datetime, formatdate
 from functools import partial
 from mimetypes import guess_type
 from secrets import token_hex
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
 import anyio
 import anyio.to_thread
-import asyncfiles
 
 from starlette._utils import create_collapsing_task_group
 from starlette.background import BackgroundTask
@@ -27,6 +26,16 @@ from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import URL, Headers, MutableHeaders
 from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
+
+if TYPE_CHECKING:
+    import asyncfiles
+else:
+    try:
+        import asyncfiles
+    except ModuleNotFoundError as exc:
+        if exc.name != "asyncfiles":
+            raise
+        asyncfiles = None
 
 
 class Response:
@@ -420,7 +429,7 @@ class FileResponse(Response):
     @asynccontextmanager
     async def _open_file(self) -> AsyncIterator[anyio.AsyncFile[bytes] | asyncfiles.BinaryFile]:
         file: anyio.AsyncFile[bytes] | asyncfiles.BinaryFile
-        if asyncio._get_running_loop() is not None:
+        if asyncfiles is not None and asyncio._get_running_loop() is not None:
             file = await asyncfiles.open(self.path, mode="rb", buffer_size=self.chunk_size).__aenter__()
         else:
             file = await anyio.open_file(self.path, mode="rb")
@@ -429,14 +438,14 @@ class FileResponse(Response):
         finally:
             # Closing must finish even when the transfer is cancelled.
             with anyio.CancelScope(shield=True):
-                if isinstance(file, asyncfiles.BinaryFile):
+                if asyncfiles is not None and isinstance(file, asyncfiles.BinaryFile):
                     await file.close()
                 else:
                     await file.aclose()
 
     @staticmethod
     async def _seek_file(file: anyio.AsyncFile[bytes] | asyncfiles.BinaryFile, offset: int) -> None:
-        if isinstance(file, asyncfiles.BinaryFile):
+        if asyncfiles is not None and isinstance(file, asyncfiles.BinaryFile):
             file.seek(offset)
         else:
             await file.seek(offset)
